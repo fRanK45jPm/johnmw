@@ -8,7 +8,7 @@
 - **What the repo ships.** Each folder under `Extensions/` is a Visual Studio Marketplace extension (publisher `richardfennellBM`). Tasks are TypeScript (npm, tsc, mocha) or PowerShell. They are packaged into `.vsix` files with `tfx` and published by one Azure DevOps YAML pipeline per extension (`Extensions/*/azure-pipelines-build.yml` or `azure-pipelines.yml`). The pipelines use the shared templates in `YAMLTemplates/`.
 - **Where it runs.** CI/CD runs in Azure DevOps (org `richardfennell`, project `github`, per the README badges) on **Microsoft-hosted agents**. The source of truth is this GitHub repo. Releases go to the Marketplace in two steps: first as a **private, tagged DEV extension**, which is installed and tested in the publisher's own org, and then, from `main` only, as the **public** extension. After that the pipeline posts a release note to a social-media webhook.
 - **Hosted compute.** The only Azure compute is the `VSTSExtensionGate` HTTP function. It is a stateless C# script that asks an Azure DevOps org whether a given task version has been installed yet, so it works as a release gate. Its readme says the code **has moved to its own repo** (`rfennell/AzureDevOpsExtensionGate`), and **no pipeline in this repo calls it**. The social-media endpoint (`socialmediaLogicAppURL`) is a second Azure component that is probably regional (assumed to be a Logic App).
-- **What can fail over.** Most of the system is global SaaS: GitHub, Azure DevOps and the Marketplace. None of it has a customer-controlled regional failover. Only the gate function, its storage and secrets, the social-media endpoint and the **build agents** can be made multi-region.
+- **What can fail over.** Most of the system is global SaaS: GitHub, Azure DevOps and the Marketplace. None of it has a customer-controlled regional failover. Only the gate function, its storage and secrets, the social-media endpoint, the **build agents** and the **DevTest Labs VM used by some test stages** can be made multi-region.
 - **Recommendation.** Run the gate **active-passive** in two paired regions behind Traffic Manager (priority routing), with one Bicep template deploying both. Add a **self-hosted / Managed DevOps Pool in a second region** as a fallback for the Windows and Linux stages. Keep the **`.vsix` artifact and a scripted `tfx` publish** as the break-glass path to the Marketplace. Before spending anything, first confirm the gate is still used (see open questions). If it is not, retiring it, or replacing it with a direct REST check, removes the only regional dependency.
 
 ## 2. Diagram 1 — current state
@@ -16,7 +16,7 @@
 ### 1a. CI/CD flow (from `azure-pipelines-build.yml` + `YAMLTemplates/`)
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph GH["GitHub (global SaaS)"]
     REPO["GitHub repo<br/>Extensions/, YAMLTemplates/"]
     GHA["GitHub Actions<br/>CodeQL, stale, add-issue-to-project"]
@@ -27,13 +27,14 @@ flowchart LR
     LIB["Library variable groups<br/>per-extension, WIKI Updater, socialMedia<br/>(PATs, IDs, vmImage)"]
     SC["Service connection<br/>Azure DevOps Marketplace (Work MSA)"]
     VAL["Azure Repos<br/>VSTSBuildTaskValidation (test data)"]
+    VALP["Validate-* pipelines + classic release<br/>(defined in the org, not in this repo)"]
     subgraph PIPE["Per-extension YAML pipeline"]
       S1["Build<br/>replacetokens, npm install/build/test,<br/>tfx package, publish vsix artifact"]
       S2["Private<br/>publish-extension.yml, visibility private + tag"]
-      S3["Test stages<br/>Windows / Linux / macOS"]
+      S3["Test stages<br/>Windows / Linux / macOS,<br/>some trigger Validate-* pipelines"]
       S4["Documentation<br/>generate-wiki-docs.yml"]
       S5["Public (main only)<br/>publish-extension.yml, visibility public"]
-      S6["Post_Publish<br/>post-publish.yml"]
+      S6["Post_Publish job (inside Public stage)<br/>post-publish.yml: bump Minor,<br/>DEV BuildUpdating + ArtifactDescription"]
     end
     MSH["Microsoft-hosted agents<br/>windows / ubuntu / macOS images"]
   end
@@ -46,6 +47,7 @@ flowchart LR
   subgraph AZ["Azure subscription (region unknown, no IaC in repo)"]
     LA["Social media webhook<br/>socialmediaLogicAppURL (Logic App, assumed)"]
     FN["VSTSExtensionGate HTTP function<br/>(sample, moved to separate repo)"]
+    DTLVM["DevTest Labs VM<br/>(own subscription, region unknown)"]
   end
 
   CONS["Consumer orgs' agents<br/>install and run tasks"]
@@ -58,14 +60,18 @@ flowchart LR
   SC -.-> S2
   SC -.-> S5
   S2 -- "tfx publish" --> PRIV
-  PRIV -- "installed in own org, used by Test + Docs" --> S3
+  PRIV -- "DEV tasks installed in own org,<br/>used by Test, Docs, Post_Publish" --> S3
   VAL -- "checkout test data" --> S3
+  S3 -- "TriggerBuild / Release Orchestrator" --> VALP
+  S3 -- "Start / Stop VM via ARM service connection<br/>(FileUtilities, BuildUpdating, DevTestLab)" --> DTLVM
   S4 -- "WikiUpdater git push" --> WIKI
   S5 -- "tfx publish" --> PUB
   S6 -- "HTTP POST release message" --> LA
   PUB -- "install / auto-update" --> CONS
-  FN -. "optional release gate, not wired in this repo" .-> S5
+  FN -. "optional gate / check (assumed),<br/>not wired in this repo" .-> S5
 ```
+
+Rendered image: [PNG](diagrams/01-cicd-flow.png) · [SVG](diagrams/01-cicd-flow.svg)
 
 ### 1b. Run-time dependencies: what the shipped tasks and the gate call
 
@@ -118,6 +124,8 @@ flowchart LR
   GATE -- "returns Deployed true/false" --> REL
 ```
 
+Rendered image: [PNG](diagrams/02-runtime-endpoints.png) · [SVG](diagrams/02-runtime-endpoints.svg)
+
 ## 3. Diagram 2 — proposed secondary-region deployment
 
 Region names are placeholders: **Region A** is the primary region and **Region B** is its Azure paired region. Choose them where the Azure DevOps org's data lives (open question Q3).
@@ -127,23 +135,24 @@ Region names are placeholders: **Region A** is the primary region and **Region B
 ```mermaid
 flowchart TB
   CALLER["Azure DevOps gate / check<br/>(global SaaS, no regional failover)"]
-  TM["Traffic Manager profile<br/>priority routing, HTTPS probe on /api/health<br/>(single global entry point)"]
+  PP["Post_Publish job<br/>(Azure DevOps, global)"]
+  TM["Traffic Manager profile (global)<br/>priority routing, HTTPS probe on /api/health<br/>(health endpoint to be added, not in run.csx;<br/>custom domain bound on both apps)"]
 
   subgraph RA["Region A (primary, active)"]
     FA["Function App A<br/>Consumption or Flex plan (assumed)"]
     STA["Storage A (ZRS)<br/>AzureWebJobsStorage, runtime only"]
     AIA["App Insights A"]
     LAA["Logic App A<br/>social media post"]
+    KV["Key Vault (proposed)<br/>gate PAT, function host key<br/>(platform-replicated to paired region,<br/>read-only on failover)"]
   end
 
   subgraph RB["Region B (paired, passive / warm standby)"]
     FB["Function App B<br/>same code + same host key"]
     STB["Storage B (ZRS)<br/>AzureWebJobsStorage, runtime only"]
     AIB["App Insights B"]
-    LAB["Logic App B<br/>disabled trigger or second URL"]
+    LAB["Logic App B<br/>same workflow, own trigger URL"]
   end
 
-  KV["Key Vault<br/>gate PAT, function host key<br/>(platform-replicated to paired region, read-only on failover)"]
   BICEP["Bicep template + deploy pipeline<br/>deploys A and B identically"]
   ADOAPI["Azure DevOps REST API<br/>(global)"]
 
@@ -158,53 +167,67 @@ flowchart TB
   FB -- "Key Vault reference, managed identity" --> KV
   FA --> ADOAPI
   FB --> ADOAPI
+  PP -- "POST socialmediaLogicAppURL" --> LAA
+  PP -. "after URL swap in socialMedia group" .-> LAB
   BICEP -.-> RA
   BICEP -.-> RB
 ```
 
+Rendered image: [PNG](diagrams/03-secondary-region-gate.png) · [SVG](diagrams/03-secondary-region-gate.svg)
+
 ### 2b. Keeping the build and publish path working
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph GLOBAL["Global SaaS: no customer failover, rely on vendor SLA"]
+    direction LR
     GHR["GitHub repo<br/>source of truth"]
     ADOP["Azure DevOps pipelines<br/>org richardfennell"]
-    MKTP["Visual Studio Marketplace"]
   end
 
-  subgraph POOLS["Agent pools"]
+  subgraph POOLS["Agent pools (pool chosen per job by variable)"]
+    direction LR
     MSH2["Microsoft-hosted pool<br/>default for all stages"]
-    subgraph SHA["Region A"]
+    subgraph SHA["Region A (proposed)"]
       MDPA["Managed DevOps Pool or VMSS pool A<br/>Windows + Linux images"]
     end
-    subgraph SHB["Region B"]
+    subgraph SHB["Region B (proposed)"]
       MDPB["Managed DevOps Pool or VMSS pool B<br/>Windows + Linux images"]
     end
   end
 
-  MAC["macOS tests<br/>Microsoft-hosted only"]
-  VSIX["Retained vsix pipeline artifact<br/>+ copy in GitHub Release (proposed)"]
-  BG["Break-glass publish<br/>tfx extension publish from any machine<br/>Marketplace PAT from Key Vault"]
-  GHAF["Optional cold-standby<br/>GitHub Actions workflow: build, package, publish"]
+  MAC["No secondary:<br/>macOS tests (Microsoft-hosted only)<br/>+ lab-VM tests (single DevTest Labs VM)"]
+
+  subgraph BREAK["Recovery path for publishing"]
+    direction LR
+    VSIX["Retained vsix pipeline artifact<br/>+ copy in GitHub Release (proposed)"]
+    BG["Break-glass publish<br/>tfx extension publish from any machine<br/>Marketplace PAT from Key Vault"]
+    GHAF["Optional cold-standby<br/>GitHub Actions workflow:<br/>build, package, publish"]
+  end
+
+  MKTP["Visual Studio Marketplace<br/>(global SaaS)"]
 
   GHR --> ADOP
-  ADOP -- "vmImage via variable group" --> MSH2
-  ADOP -. "switch pool variable on hosted outage" .-> MDPA
-  ADOP -. "switch pool variable if Region A down" .-> MDPB
-  ADOP -. "mark non-blocking during outage" .-> MAC
-  ADOP --> VSIX
-  ADOP -- "PublishExtension task" --> MKTP
+  ADOP -- "1. default" --> MSH2
+  ADOP -. "2. hosted outage" .-> MDPA
+  ADOP -. "3. Region A down" .-> MDPB
+  ADOP -. "skip via runtime parameter<br/>during outage" .-> MAC
+  POOLS -- "PublishExtension task" --> MKTP
+  POOLS -- "publish vsix artifact" --> VSIX
   VSIX --> BG
   BG -- "if Azure DevOps is down" --> MKTP
   GHR -.-> GHAF
   GHAF -. "if Azure DevOps is down for long" .-> MKTP
 ```
 
+Rendered image: [PNG](diagrams/04-build-publish-continuity.png) · [SVG](diagrams/04-build-publish-continuity.svg)
+
 **How the pipeline keeps working:**
 
 1. **Agent outage (Microsoft-hosted capacity in the org's geography is down).** Every pipeline already reads its pool from the `vmImage` variable in its Library group. Change the pipelines to read a pool **name** variable as well (`pool: name: $(agentPool)`, `vmImage` optional). Then repointing a variable group moves the Build, Private, Documentation and Public stages to a self-hosted pool with no YAML change. The commented-out `# name: default` lines show a self-hosted pool called `default` was used before.
-2. **Two-region self-hosted pools.** Run a **Managed DevOps Pool** or an Azure VM Scale Set agent pool in Region A and another in Region B. Azure DevOps routes each job to whichever pool you name. Both pools must provide **Windows** images: the templates use Windows-style paths (`..\..\YAMLTemplates\...`, `'\\'` in `workingDir`), so the Build and publish jobs assume a Windows agent. Images also need npm, Node and PowerShell.
+2. **Two-region self-hosted pools.** Run a **Managed DevOps Pool** or an Azure VM Scale Set agent pool in Region A and another in Region B. Azure DevOps routes each job to whichever pool you name. Both pools must provide **Windows** images: the steps use Windows-style agent paths (`'\\'` in `workingDir` in `build-node-task.yml`, `$(Build.ArtifactStagingDirectory)\\...` output paths and the `vsixPath` passed to `publish-extension.yml`), so the Build, Private and Public jobs assume a Windows agent. (The `..\..\YAMLTemplates\...` include paths are resolved by Azure DevOps when the YAML is compiled, so they do not depend on the agent OS.) Images also need npm, Node and PowerShell.
 3. **macOS tests** cannot move to an Azure-hosted self-hosted pool, because Azure offers no macOS VMs. During an outage, skip those stages behind a runtime parameter, for example `runMacTests: false`. Otherwise they are the single point of failure.
+   The same applies to the **lab-VM test stages** (`Test_PrivateAzure` in FileUtilities, `Test_Builds` in BuildUpdating, `Test` in DevTestLab). They start a single DevTest Labs VM through the `RF MVP Visual Studio Enterprise` Azure service connection, so they fail if that VM's region is down. Gate them behind a parameter too, for example `runLabVmTests: false`.
 4. **Marketplace publish path.** The Marketplace is global and has no failover, so the aim is to be able to **publish again later from a known artifact**. Do three things:
    - Keep the `vsix` pipeline artifact. Also attach it to a GitHub Release, which is proposed.
    - Store the Marketplace PAT behind the `Azure DevOps Marketplace (Work MSA)` service connection in Key Vault as well, and watch its expiry. An expired PAT is a likelier failure than a regional outage.
@@ -234,17 +257,21 @@ RTO/RPO values are **proposed targets**, not measured.
 | Observability | App Insights per region (proposed) | Independent | Telemetry | None; accept loss of telemetry during outage | n/a / telemetry gap |
 | Social-media webhook (`socialmediaLogicAppURL`) | Azure, Logic App assumed, region unknown | Primary only today; proposed second Logic App in B | Workflow definition only | Swap URL in `socialMedia` variable group; non-critical, so failures can simply be ignored | 1 day / 0 |
 | External download endpoints (github.com, objects.githubusercontent.com, storage.googleapis.com, api.github.com, api.bitbucket.org) | Third-party global SaaS | Outside our control | None | WikiPDFExport already supports a locally stored copy of the tool as fallback | n/a |
-| DevTest Labs VMs | Consumer's Azure subscription | Consumer's design | Consumer's | Out of scope | n/a |
+| DevTest Labs VM used by own test stages | Publisher's Azure subscription (via `RF MVP Visual Studio Enterprise` service connection), region unknown | Single VM, no secondary | VM disk / agent config (assumed) | None today; skip lab-VM stages via runtime parameter. Optional: rebuild in Region B from an image | n/a (skipped) |
+| `Validate-*` pipelines and classic release triggered by tests | Azure DevOps (same org; definitions not in this repo) | Single | Pipeline definitions | Same as the Azure DevOps org | Vendor / vendor |
+| DevTest Labs VMs targeted by consumers' DevTestLab tasks | Consumer's Azure subscription | Consumer's design | Consumer's | Out of scope | n/a |
 
 ## 5. Assumptions, open questions, trade-offs and recommendation
 
 ### From the repo (facts)
 
-- Pipelines use the stage order Build → Private → Test(s) → Documentation → Public (only on `refs/heads/main`) → Post_Publish. They are triggered by changes to `main` and to PRs, filtered by path. This is what `Extensions/*/azure-pipelines-build.yml` shows.
+- Pipelines use the stage order Build → Private → Test(s) → Documentation → Public (only on `refs/heads/main`). `Post_Publish` is a job inside the Public stage that runs after `Public_Deployment`. They are triggered by changes to `main` and to PRs, filtered by path. This is what `Extensions/*/azure-pipelines-build.yml` and `azure-pipelines.yml` show.
+- Private, Test, Documentation and Public are `deployment` jobs targeting Azure DevOps environments named `Azure DevOps Marketplace (Private)`, `(Public)`, `(Documentation)` and one per extension. Any approvals or checks on those environments are configured in the org, not in the repo.
+- Some test stages depend on resources outside the pipeline: FileUtilities, BuildUpdating and DevTestLab start a DevTest Labs VM via the `RF MVP Visual Studio Enterprise` Azure service connection; FileUtilities, BuildUpdating and Versioning queue `Validate-*` pipelines with `TriggerBuild@3`; BuildUpdating runs a classic release in another project with Release Orchestrator.
 - Publishing uses `ms-devlabs` `PublishExtension@4` with `TfxInstaller@3`, through service connection `Azure DevOps Marketplace (Work MSA)` (`YAMLTemplates/publish-extension.yml`).
 - Pools are Microsoft-hosted `vmImage` values: from the `vmImage` variable, or `windows-latest`, `windows-2019`, `ubuntu-latest` and `macOS-latest`. A `# name: default` self-hosted pool is commented out.
 - The Documentation stage dogfoods the private DEV builds of YamlGenerator and WikiUpdater (`YAMLTemplates/generate-wiki-docs.yml`).
-- Post_Publish auto-increments `Minor`, then POSTs JSON to `$(socialmediaLogicAppURL)` from the `socialMedia` variable group (`YAMLTemplates/post-publish.yml`).
+- Post_Publish auto-increments `Minor` with the DEV BuildUpdating task, reads the PR reason with the DEV ArtifactDescription task, then POSTs JSON to `$(socialmediaLogicAppURL)` from the `socialMedia` variable group (`YAMLTemplates/post-publish.yml`).
 - `VSTSExtensionGate/run.csx` is an HTTP-trigger C# script. It takes `pat`, `instance`, `taskguid` and `version` in the body and calls `https://{instance}.visualstudio.com/_apis/distributedtask/tasks/{taskGuid}`. It returns `{ Deployed: bool }` and keeps no state. Its readme says it was a portal paste-in sample and now lives in `rfennell/AzureDevOpsExtensionGate`.
 - Run-time endpoints, by task:
   - WikiPDFExport uses `download-github-release` to fetch from `MaxMelcher/AzureDevOps.WikiPDFExport`. Its readme lists github.com, objects.githubusercontent.com and storage.googleapis.com.
@@ -260,6 +287,7 @@ RTO/RPO values are **proposed targets**, not measured.
 - **A4.** The Documentation stage writes to this project's GitHub wiki, inferred from the `GitHubPat` parameter and manifest links. The actual repo URL is in the `WIKI Updater` variable group, which is not in the repo.
 - **A5.** Region A / Region B are an Azure paired region pair close to the Azure DevOps org's geography.
 - **A6.** RTO/RPO numbers are proposed targets, sized for a single-maintainer open-source project.
+- **A7.** The DevTest Labs VM hosts a self-hosted agent that runs the `Validate-*` pipelines, inferred from the VM being started just before those builds are queued.
 
 ### Open questions
 
@@ -270,6 +298,7 @@ RTO/RPO values are **proposed targets**, not measured.
 - **Q5.** Is a self-hosted pool acceptable cost-wise, or is "wait for Microsoft-hosted to recover" an acceptable RTO for an OSS project?
 - **Q6.** When does the Marketplace PAT expire, and who rotates it?
 - **Q7.** Should IaC (Bicep) live in this repo or in the separate gate repo?
+- **Q8.** Which region holds the DevTest Labs VM, and is a lab-VM test run required before every public release?
 
 ### Cost / complexity trade-off
 
